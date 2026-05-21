@@ -1,0 +1,9 @@
+# Required
+playwright>=1.40
+python-dotenv>=1.0
+
+# Optional — enables FREE auto-solving of hCaptcha via local ONNX models.
+# If you skip this, the script will pause and let you solve it by hand.
+# Install with:   pip install hcaptcha-challenger
+# Repo:           https://github.com/QIN2DIM/hcaptcha-challenger
+# hcaptcha-challenger>=0.10
