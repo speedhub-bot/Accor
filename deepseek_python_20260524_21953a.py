@@ -1021,7 +1021,7 @@ async def run_interactive() -> None:
                 _clog(f"File not found: {combo_path}", "err")
                 continue
             args = argparse.Namespace(
-                show=False, headless=False, fresh=False, keep_open=False
+                show=False, headless=False, fresh=False, keep_open=False, proxy=None
             )
             await _run_combo(Path(combo_path), [], args)
         elif choice == "3":
@@ -1040,7 +1040,7 @@ async def run_interactive() -> None:
                 _clog("No proxies found in file", "err")
                 continue
             args = argparse.Namespace(
-                show=False, headless=False, fresh=False, keep_open=False
+                show=False, headless=False, fresh=False, keep_open=False, proxy=None
             )
             await _run_combo(Path(combo_path), proxies, args)
         elif choice == "4":

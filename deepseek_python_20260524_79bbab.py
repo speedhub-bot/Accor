@@ -983,7 +983,7 @@ async def run_single_mode(email: str, password: str, args: argparse.Namespace) -
         spa_state = await _grab_page_state(page)
         member_id = "unknown"
         for item in bag.items.values():
-            body = item.body if isinstance(body, dict) else None
+            body = item.body if isinstance(item.body, dict) else None
             if not body:
                 continue
             for key in ("memberId", "cardNumber", "customerId", "id"):
