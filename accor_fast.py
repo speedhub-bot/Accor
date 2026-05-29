@@ -184,7 +184,18 @@ async def do_login_flow(page, email, password, verbose=False, cached_oauth_url=N
     try:
         # ── Navigate to login ─────────────────────────────────────────
         if cached_oauth_url:
-            # Fast path: go straight to the login form using cached URL
+            # We have the OAuth URL cached, but we still need to visit
+            # the homepage briefly to re-establish the Imperva/reese84
+            # cookie (it was cleared between combos). The Chrome already
+            # passed the JS challenge before, so this resolves in ~1-2s.
+            try:
+                await page.goto('https://all.accor.com/a/en.html',
+                                wait_until='domcontentloaded', timeout=20000)
+            except PwTimeout:
+                pass
+            await page.wait_for_timeout(1500)
+
+            # Now go to the cached login URL
             try:
                 await page.goto(cached_oauth_url, wait_until='domcontentloaded', timeout=20000)
             except PwTimeout:
@@ -498,20 +509,13 @@ async def browser_worker(worker_id, queue, proxies, proxy, chrome_path,
                 except asyncio.QueueEmpty:
                     break
 
-                # Smart cookie clear: keep reese84/Imperva, only wipe login session
+                # Full cookie clear between combos — simple and reliable.
+                # The Chrome instance already passed Imperva's JS challenge
+                # once, so subsequent visits solve instantly (< 1s).
                 try:
-                    all_cookies = await context.cookies()
-                    imperva_cookies = [c for c in all_cookies
-                                       if c.get('name', '') in ('reese84', 'visid_incap', 'incap_ses')
-                                       or 'incap' in c.get('name', '').lower()]
                     await context.clear_cookies()
-                    if imperva_cookies:
-                        await context.add_cookies(imperva_cookies)
                 except Exception:
-                    try:
-                        await context.clear_cookies()
-                    except Exception:
-                        pass
+                    pass
 
                 try:
                     result = await do_login_flow(page, email, password, verbose, cached_oauth_url)
