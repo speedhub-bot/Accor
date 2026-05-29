@@ -309,6 +309,14 @@ async def do_login_flow(page, email, password, verbose=False):
                 if verbose:
                     print(f"  [i] Found OAuth URL, navigating directly...")
                 await page.goto(auth_url, wait_until='domcontentloaded', timeout=30000)
+                # Give the login page time to fully render. Under Imperva
+                # the email form often isn't in the DOM until a few seconds
+                # after domcontentloaded, especially in headless / hidden
+                # modes — so we wait for networkidle + a short grace.
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=15000)
+                except Exception:
+                    pass
                 await page.wait_for_timeout(1500)
             else:
                 # Fallback: Click the Sign in button using JavaScript (bypass visibility)
@@ -353,9 +361,29 @@ async def do_login_flow(page, email, password, verbose=False):
             print(f"  [i] On login page, entering email...")
 
         # Step 3: Wait for and fill email
+        # We wait up to 30s here (was 10s) because Imperva's challenge can
+        # delay the form rendering, especially in hidden/off-screen Chrome.
+        # Also try a few selector variants since Accor occasionally tweaks
+        # the markup.
         try:
-            email_input = page.locator('input[type="email"], input[type="text"]').first
-            await email_input.wait_for(state='visible', timeout=10000)
+            # Try waiting for the form to appear (any of the common variants)
+            email_input = page.locator(
+                'input[type="email"], '
+                'input[name*="email" i], '
+                'input[autocomplete="username"], '
+                'input[type="text"]'
+            ).first
+            try:
+                await email_input.wait_for(state='visible', timeout=30000)
+            except PwTimeout:
+                # One more shot: maybe the page is still loading from an
+                # Imperva challenge — give it a final settle and retry.
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=10000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(2000)
+                await email_input.wait_for(state='visible', timeout=10000)
             await email_input.fill(email)
             await page.wait_for_timeout(300)
         except Exception as e:
@@ -652,9 +680,12 @@ async def check_account_cdp(email, password, cdp_url='http://localhost:29229', v
 async def check_account_standalone(email, password, proxy=None, verbose=False, browser_path=None, headless=True, block_resources=True):
     """Check account by launching a fresh Chrome instance.
 
-    headless=True (default): runs Chrome in --headless=new mode — no visible
-    window, doesn't steal focus, much lower CPU/RAM, and still passes Imperva.
-    headless=False: classic visible window (use only for debugging).
+    headless=True (default): launches a real, fully-rendered Chrome whose
+    window is parked off-screen at (-32000, -32000). The user never sees
+    it and it doesn't steal focus, but the browser is still indistinguishable
+    from a human-driven Chrome (so it passes Imperva / reese84).
+    headless=False: visible on-screen Chrome window — only useful for
+    debugging the login flow.
     block_resources=True: skip images/fonts/media to make page loads ~2-3x
     faster (CSS/JS/XHR are still allowed since the login form needs them).
     """
@@ -696,15 +727,21 @@ async def check_account_standalone(email, password, proxy=None, verbose=False, b
             ]
 
             if headless:
-                # Use the *new* headless mode (Chrome 109+). It supports
-                # extensions (needed for proxy auth) and is far harder to
-                # fingerprint than legacy --headless. We pass it ourselves and
-                # keep Playwright's headless=False so it doesn't override us.
-                launch_args.append('--headless=new')
-                launch_args.append('--window-size=1280,800')
-            else:
-                # Visible mode — minimize off-screen so it doesn't steal focus.
+                # "Hidden" mode = real, fully-rendered Chrome whose window is
+                # parked off-screen at (-32000, -32000). The browser is still
+                # a 100% real headed Chrome — same JS environment, same WebGL,
+                # same fingerprint — so Imperva / reese84 treats it as a human.
+                # The user just never sees the window and it doesn't steal
+                # focus, so they can keep working on their PC.
+                #
+                # Why not --headless=new ?  In testing, Accor's anti-bot still
+                # flags the new headless engine and rejects logins outright,
+                # so it's a no-go for this site even though it's "modern".
                 launch_args.append('--window-position=-32000,-32000')
+                launch_args.append('--window-size=1280,800')
+                launch_args.append('--start-minimized')
+            else:
+                # Visible debugging mode — normal on-screen Chrome window.
                 launch_args.append('--window-size=1280,800')
 
             if proxy:
@@ -738,7 +775,7 @@ async def check_account_standalone(email, password, proxy=None, verbose=False, b
                         break
 
             if verbose:
-                mode = 'headless=new' if headless else 'visible (off-screen)'
+                mode = 'hidden (off-screen)' if headless else 'visible'
                 print(f"  [i] Chrome: {chrome_path or 'Playwright Chromium fallback'} [{mode}]")
 
             context = await p.chromium.launch_persistent_context(
@@ -937,12 +974,11 @@ def _print_menu(s):
     print(f"  {C.GREY}{'─' * 30}{C.RESET}")
 
     print(f"   {C.CYAN}[5]{C.RESET} Hidden Chrome ....... {s.fmt_toggle(s.headless)}")
-    print(f"        {C.GREY}↪ ON  = Chrome runs invisibly via --headless=new.  No window,"
-          f"{C.RESET}")
-    print(f"        {C.GREY}        no focus stealing, low CPU/RAM.  Default & recommended."
-          f"{C.RESET}")
-    print(f"        {C.GREY}  OFF = Visible Chrome window, useful for debugging the login."
-          f"{C.RESET}")
+    print(f"        {C.GREY}↪ ON  = Real Chrome runs off-screen at (-32000,-32000). You{C.RESET}")
+    print(f"        {C.GREY}        never see the window and it can't steal focus, but{C.RESET}")
+    print(f"        {C.GREY}        it's a fully-rendered Chrome so Imperva treats it as{C.RESET}")
+    print(f"        {C.GREY}        human.  Default & recommended.{C.RESET}")
+    print(f"        {C.GREY}  OFF = Visible on-screen Chrome window — useful for debugging.{C.RESET}")
 
     print(f"   {C.CYAN}[6]{C.RESET} Block heavy assets .. {s.fmt_toggle(s.block_resources)}")
     print(f"        {C.GREY}↪ ON  = Skip downloading images/fonts/media → ~2-3x faster."
@@ -1188,7 +1224,7 @@ async def run_checker(combo_source, proxy_arg, cdp_arg, chrome_path, verbose, ou
     if cdp_arg:
         print(f"[*] Mode: CDP ({cdp_arg})")
     else:
-        mode_label = 'Standalone Chrome [HEADLESS - hidden]' if headless else 'Standalone Chrome [VISIBLE]'
+        mode_label = 'Standalone Chrome [HIDDEN - off-screen]' if headless else 'Standalone Chrome [VISIBLE]'
         print(f"[*] Mode: {mode_label}")
 
     # Prepare output files
