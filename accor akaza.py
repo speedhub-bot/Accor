@@ -392,25 +392,44 @@ async def do_login_flow(page, email, password, verbose=False):
 
         # Step 4: Submit email
         await page.locator('button[type="submit"]').first.click(timeout=5000)
-        await page.wait_for_timeout(1500)
 
-        # Step 5: Check what appeared
-        page_html = await page.content()
+        # Step 5: Wait for the next page to load. Accor does an internal
+        # transition between the email step and the password step, which can
+        # take several seconds (especially behind Imperva). Previously we
+        # only waited ~3s and then bailed — that was killing valid accounts
+        # whose password page just hadn't rendered yet. Now we actively
+        # poll up to 30s for *either* the password field to appear OR a
+        # clear "create account" prompt indicating the email isn't
+        # registered.
+        try:
+            await page.wait_for_load_state('networkidle', timeout=15000)
+        except Exception:
+            pass
 
-        # Check if account doesn't exist (shows create account form)
-        if 'Create your account' in page_html or 'create an account' in page_html.lower():
-            result['error'] = 'Account not found (email not registered)'
-            return result
-
-        # Check if password field exists
-        pw_count = await page.locator('input[type="password"]').count()
-        if pw_count == 0:
-            # Maybe still loading or different flow
-            await page.wait_for_timeout(1500)
+        password_locator = page.locator('input[type="password"]').first
+        try:
+            # Active wait — succeeds the moment the password field is in
+            # the DOM and visible (not after a fixed sleep).
+            await password_locator.wait_for(state='visible', timeout=30000)
+            pw_count = 1
+        except PwTimeout:
             pw_count = await page.locator('input[type="password"]').count()
 
+        # Only inspect page text *after* the wait above, so we don't get
+        # tricked by transitional UI. If the password field never showed
+        # up, see whether the page is telling us the account doesn't exist.
         if pw_count == 0:
-            result['error'] = 'No password field (account may not exist)'
+            try:
+                page_html = await page.content()
+            except Exception:
+                page_html = ''
+            page_text = page_html.lower()
+            if 'create your account' in page_text or 'create an account' in page_text:
+                result['error'] = 'Account not found (email not registered)'
+            elif any(x in page_text for x in ['locked', 'blocked', 'too many', 'verrouillé']):
+                result['error'] = 'Rate limited / blocked by Imperva'
+            else:
+                result['error'] = 'Password field never appeared (page slow / blocked)'
             return result
 
         if verbose:
