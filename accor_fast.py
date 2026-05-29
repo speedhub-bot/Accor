@@ -182,31 +182,59 @@ async def do_login_flow(page, email, password, verbose=False):
     }
 
     try:
-        # Navigate straight to login (skip homepage, save time)
+        # Step 1: Visit homepage FIRST — this is critical for Imperva.
+        # Imperva sets the reese84 cookie on the main domain. If we go
+        # straight to login.accor.com, we get blocked. The homepage visit
+        # solves the challenge in the real Chrome environment.
         try:
-            await page.goto(
-                'https://login.accor.com/authorize?client_id=AccorHotels-oneApp-Android'
-                '&redirect_uri=https://all.accor.com/a/en.html'
-                '&scope=openid+profile+email&response_type=code',
-                wait_until='domcontentloaded', timeout=25000
-            )
+            await page.goto('https://all.accor.com/a/en.html',
+                            wait_until='domcontentloaded', timeout=30000)
         except PwTimeout:
             pass
+        await page.wait_for_timeout(2000)
 
-        # Wait for login form to load
-        try:
-            await page.wait_for_load_state('networkidle', timeout=12000)
-        except Exception:
-            pass
-
-        # Make sure we're on login page
+        # Step 2: Extract the OAuth login URL from the page (same as
+        # accor akaza.py's working approach)
         if 'login.accor.com' not in page.url:
-            # Try direct URL
-            try:
-                await page.goto('https://login.accor.com/', wait_until='domcontentloaded', timeout=15000)
-                await page.wait_for_load_state('networkidle', timeout=10000)
-            except Exception:
-                pass
+            auth_url = await page.evaluate('''() => {
+                // The sign-in link is inside ace-block-enrollment's Shadow DOM
+                const el = document.querySelector('ace-block-enrollment');
+                if (el && el.shadowRoot) {
+                    const link = el.shadowRoot.querySelector('a[href*="authentication"]');
+                    if (link) return link.href;
+                }
+                // Fallback: check regular DOM
+                const links = document.querySelectorAll('a[href*="api.accor.com/authentication"]');
+                for (const l of links) return l.href;
+                return null;
+            }''')
+
+            if auth_url:
+                try:
+                    await page.goto(auth_url, wait_until='domcontentloaded', timeout=30000)
+                except PwTimeout:
+                    pass
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=15000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
+            else:
+                # Fallback: click the Sign in button via JS
+                await page.evaluate('''() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        if (b.textContent.trim().includes('Sign in')) { b.click(); return; }
+                    }
+                    const links = document.querySelectorAll('a');
+                    for (const l of links) {
+                        if (l.textContent.trim() === 'Sign in') { l.click(); return; }
+                    }
+                }''')
+                try:
+                    await page.wait_for_url('**/login.accor.com/**', timeout=20000)
+                except PwTimeout:
+                    pass
 
         if 'login.accor.com' not in page.url:
             result['error'] = f'Cannot reach login page ({page.url[:50]})'
